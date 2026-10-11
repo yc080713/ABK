@@ -28,16 +28,22 @@
 
 **如何启用**：
 
-在 `kernel-custom` 工作流里设置：
+用专用入口 **Actions → 「内核构建 - SM8650 (8 Gen 3) Gunyah 修复」**
+（`.github/workflows/kernel-sm8650-gunyah.yml`），它已经把 `android14` + `6.1` + `use_gunyah=true`
+固定好，只需要选：
 
-| 参数 | 值 | 说明 |
-|------|----|------|
-| `android_version` | `android14` | Gunyah 修复只针对 android14 / 6.1 |
-| `kernel_version` | `6.1` | |
-| `sub_level` | `138` | 与补丁基线一致，其他 6.1 子版本补丁可能 reject |
-| `os_patch_level` | `2025-06` | |
-| `use_gunyah` | `true` | 应用本补丁 |
-| `gunyah_builtin_qcom_platform` | `true` | 同时写入 `CONFIG_GUNYAH_QCOM_PLATFORM=y` |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `sub_level` | `138` | 6.1 子版本号，如 `138` / `118`；与补丁基线一致时最稳 |
+| `os_patch_level` | `2025-06` | 需与子版本对应（例如 `118` ↔ `2025-01`） |
+| `gunyah_builtin_qcom_platform` | `true` | 写入 `CONFIG_GUNYAH_QCOM_PLATFORM=y`，必须开启补丁才会编译进 `Image` |
+| `kernelsu_variant` / `kernelsu_branch` / `cancel_susfs` | `BakaSU` / `Stable(标准)` / `true` | 按需选择 |
+
+> 为什么不放进 `kernel-custom`：该工作流的 `workflow_dispatch` 已经用满 GitHub 的
+> 25 个 inputs 上限，再加输入会让整个文件校验失败
+> （`you may only define up to 25 inputs for a workflow_dispatch event`）。
+> `build.yml` 仍然保留 `use_gunyah` / `gunyah_builtin_qcom_platform` 两个 `workflow_call`
+> 输入（`workflow_call` 没有 25 上限），其他工作流也可以直接按需传参。
 
 ### 为什么需要 `gunyah_builtin_qcom_platform`
 
