@@ -1,0 +1,133 @@
+# SM8650 (骁龙 8 Gen 3 / 小米14 / Redmi K70) 专用构建入口
+#
+# 为什么单独开一个工作流：
+#   kernel-custom.yml 的 workflow_dispatch 已经用满 GitHub 的 25 个 inputs 上限，
+#   无法再往里加 use_gunyah / gunyah_builtin_qcom_platform，所以这里开一个
+#   专用入口，把 android14 + 6.1 + Gunyah VMID 修复固定下来。
+#
+# 修复内容与前置条件见 patches/README.md。
+name: 内核构建 - SM8650 (8 Gen 3) Gunyah 修复
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ==================== 内核版本 ====================
+      sub_level:
+        description: "6.1 子版本号 (如 118 / 138)"
+        required: true
+        type: string
+        default: "138"
+      os_patch_level:
+        description: "安全补丁级别 (需与子版本对应，如 2025-06)"
+        required: true
+        type: string
+        default: "2025-06"
+
+      # ==================== Gunyah VMID 修复 ====================
+      gunyah_builtin_qcom_platform:
+        description: "启用 CONFIG_GUNYAH_QCOM_PLATFORM=y（必须开启，补丁才会编译进 Image）"
+        required: false
+        type: boolean
+        default: true
+
+      # ==================== KernelSU ====================
+      kernelsu_variant:
+        description: "KernelSU 变体"
+        required: true
+        type: choice
+        options:
+          - None
+          - Official
+          - SukiSU
+          - BakaSU
+        default: BakaSU
+      kernelsu_branch:
+        description: "KSU 分支"
+        required: true
+        type: choice
+        options:
+          - Stable(标准)
+          - Dev(开发)
+          - Latest(最新)
+          - Custom(自定义)
+        default: Stable(标准)
+      custom_ref:
+        description: "自定义引用 (仅在 KSU 分支为 Custom(自定义) 时使用)"
+        required: false
+        type: string
+      cancel_susfs:
+        description: "禁用 SUSFS"
+        required: false
+        type: boolean
+        default: true
+
+      # ==================== 可选功能 ====================
+      use_zram:
+        description: "启用 ZRAM 增强（含 lz4k/lz4kd/lz4k_oplus 补丁栈）"
+        required: false
+        type: boolean
+        default: false
+      zram_full_algo:
+        description: "ZRAM 完整算法（需先开 use_zram；6.12 会自动跳过 legacy LZ4K 系列）"
+        required: false
+        type: boolean
+        default: false
+      virtualization_support:
+        description: "DroidSpaces 虚拟化支持"
+        required: false
+        type: choice
+        options:
+          - "off"
+          - "on"
+          - "678"
+          - "123"
+          - "345"
+        default: "off"
+
+jobs:
+  build-sm8650-gunyah:
+    name: "SM8650-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}"
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+    with:
+      # 固定 android14 / 6.1：Gunyah VMID 修复只在这条线上验证过
+      android_version: "android14"
+      kernel_version: "6.1"
+      sub_level: ${{ inputs.sub_level }}
+      os_patch_level: ${{ inputs.os_patch_level }}
+
+      ksu_variant: ${{ inputs.kernelsu_variant }}
+      ksu_branch: ${{ inputs.kernelsu_branch }}
+      custom_ref: ${{ inputs.custom_ref || '' }}
+
+      # Gunyah 8 Gen 3 VMID 修复（本工作流的存在意义）
+      use_gunyah: true
+      gunyah_builtin_qcom_platform: ${{ inputs.gunyah_builtin_qcom_platform }}
+
+      # 其余可选功能：默认关闭，保持镜像尽量接近 GKI 基线
+      use_zram: ${{ inputs.use_zram }}
+      zram_full_algo: ${{ inputs.zram_full_algo || false }}
+      zram_extra_algos: ""
+      use_bbg: false
+      use_ddk: false
+      use_ntsync: false
+      use_networking: false
+      use_kpm: false
+      use_rekernel: false
+      supp_op: false
+      enable_susfs: ${{ !inputs.cancel_susfs }}
+      virtualization_support: ${{ inputs.virtualization_support || 'off' }}
+      custom_external_modules: ""
+      custom_kernel_options: ""
+
+  get-ksu-manager:
+    uses: ./.github/workflows/get-manager.yml
+    secrets: inherit
+    with:
+      kernelsu_variant: ${{ inputs.kernelsu_variant }}
+      ksu_branch: ${{ inputs.kernelsu_branch }}
+      custom_ref: ${{ inputs.custom_ref || '' }}
