@@ -1,11 +1,16 @@
 # SM8650 (骁龙 8 Gen 3 / 小米14 / Redmi K70) 专用构建入口
 #
-# 为什么单独开一个工作流：
+# 为什么单独开一个入口：
 #   kernel-custom.yml 的 workflow_dispatch 已经用满 GitHub 的 25 个 inputs 上限，
-#   无法再往里加 use_gunyah / gunyah_builtin_qcom_platform，所以这里开一个
-#   专用入口，把 android14 + 6.1 + Gunyah VMID 修复固定下来。
+#   再往里加 use_gunyah / gunyah_builtin_qcom_platform 会让整个文件校验失败：
+#   "you may only define up to 25 inputs for a workflow_dispatch event"
 #
-# 修复内容与前置条件见 patches/README.md。
+# 与 kernel-custom.yml 的差异（其余选项完全一致）：
+#   1. android_version / kernel_version 固定为 android14 / 6.1（Gunyah VMID 修复只在这条线验证过）
+#   2. use_gunyah 固定为 true（本入口的存在意义），额外暴露 gunyah_builtin_qcom_platform
+#   3. 没有「修订版本 revision」：build.yml 只在 android12 生成 boot.img 时用到它，6.1 用不到
+#
+# 补丁与前置条件见 patches/README.md。
 name: 内核构建 - SM8650 (8 Gen 3) Gunyah 修复
 
 permissions:
@@ -17,24 +22,17 @@ on:
     inputs:
       # ==================== 内核版本 ====================
       sub_level:
-        description: "6.1 子版本号 (如 118 / 138)"
+        description: "子版本号 (6.1，如 118 / 138)"
         required: true
         type: string
         default: "138"
       os_patch_level:
-        description: "安全补丁级别 (需与子版本对应，如 2025-06)"
+        description: "安全补丁级别 (需与子版本对应，如 2025-01 / 2025-06)"
         required: true
         type: string
         default: "2025-06"
 
-      # ==================== Gunyah VMID 修复 ====================
-      gunyah_builtin_qcom_platform:
-        description: "启用 CONFIG_GUNYAH_QCOM_PLATFORM=y（必须开启，补丁才会编译进 Image）"
-        required: false
-        type: boolean
-        default: true
-
-      # ==================== KernelSU ====================
+      # ==================== KernelSU 配置 ====================
       kernelsu_variant:
         description: "KernelSU 变体"
         required: true
@@ -55,29 +53,25 @@ on:
           - Latest(最新)
           - Custom(自定义)
         default: Stable(标准)
+
+      # ==================== 可选配置 ====================
       custom_ref:
-        description: "自定义引用 (仅在 KSU 分支为 Custom(自定义) 时使用)"
+        description: "自定义引用 (仅在 KSU 分支为 'Custom(自定义)' 时使用)"
         required: false
         type: string
-      cancel_susfs:
-        description: "禁用 SUSFS"
+      version:
+        description: "自定义版本名 (可选)"
         required: false
-        type: boolean
-        default: true
+        type: string
+      build_time:
+        description: "自定义构建时间 (可选，N或留空=当前UTC)"
+        required: false
+        type: string
+        default: "Sun Dec 01 08:10:00 UTC 2024"
 
-      # ==================== 可选功能 ====================
-      use_zram:
-        description: "启用 ZRAM 增强（含 lz4k/lz4kd/lz4k_oplus 补丁栈）"
-        required: false
-        type: boolean
-        default: false
-      zram_full_algo:
-        description: "ZRAM 完整算法（需先开 use_zram；6.12 会自动跳过 legacy LZ4K 系列）"
-        required: false
-        type: boolean
-        default: false
+      # ==================== 虚拟化支持 ====================
       virtualization_support:
-        description: "DroidSpaces 虚拟化支持"
+        description: "虚拟化支持 (5.10~6.6: 槽位补丁)"
         required: false
         type: choice
         options:
@@ -88,13 +82,98 @@ on:
           - "345"
         default: "off"
 
+      # ==================== Gunyah VMID 修复 ====================
+      gunyah_builtin_qcom_platform:
+        description: "同时启用 CONFIG_GUNYAH_QCOM_PLATFORM=y（不开启则 gunyah_qcom.c 不编译，补丁无效）"
+        required: false
+        type: boolean
+        default: true
+
+      # ==================== 功能开关 ====================
+      use_zram:
+        description: "启用 ZRAM 增强算法"
+        required: true
+        type: boolean
+        default: false
+      use_bbg:
+        description: "启用 BBG 防格机"
+        required: true
+        type: boolean
+        default: false
+      use_ddk:
+        description: "启用 DDK 防格机 LSM"
+        required: true
+        type: boolean
+        default: false
+      use_ntsync:
+        description: "启用 NTsync"
+        required: false
+        type: boolean
+        default: false
+      use_networking:
+        description: "启用网络增强（IPSet + BBR）"
+        required: false
+        type: boolean
+        default: false
+      use_kpm:
+        description: "启用 KPM 功能"
+        required: true
+        type: boolean
+        default: false
+      use_rekernel:
+        description: "启用 Re-Kernel 驱动"
+        required: false
+        type: boolean
+        default: false
+      cancel_susfs:
+        description: "禁用 SUSFS"
+        required: true
+        type: boolean
+        default: false
+      supp_op:
+        description: "启用一加 8E 支持"
+        required: false
+        type: boolean
+        default: false
+
+      # ==================== ZRAM 扩展选项 ====================
+      zram_full_algo:
+        description: "启用 ZRAM 完整算法支持（6.12 自动跳过 legacy LZ4K/LZ4KD/LZ4K_OPLUS）"
+        required: false
+        type: boolean
+        default: false
+      zram_extra_algos:
+        description: "自定义 ZRAM 算法（逗号分隔，如 lzo,lz4,deflate,zstd；6.12 会忽略 lz4k/lz4kd/lz4k_oplus）"
+        required: false
+        type: string
+        default: ""
+
+      # ==================== KPM 扩展选项 ====================
+      kpm_password:
+        description: "自定义 KPM 超级密码（留空=使用默认密码）"
+        required: false
+        type: string
+        default: ""
+
+      # ==================== 自定义外部模块 ====================
+      custom_external_modules:
+        description: "自定义外部模块（兼容旧 repo;stage，也支持 module:repo;stage 与 set:repo#child;stage，用 | 分隔）"
+        required: false
+        type: string
+        default: ""
+      custom_kernel_options:
+        description: "自定义内核选项（每行一条 Kconfig/defconfig 片段）"
+        required: false
+        type: string
+        default: ""
+
 jobs:
   build-sm8650-gunyah:
     name: "SM8650-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}"
     uses: ./.github/workflows/build.yml
     secrets: inherit
     with:
-      # 固定 android14 / 6.1：Gunyah VMID 修复只在这条线上验证过
+      # 固定 android14 / 6.1
       android_version: "android14"
       kernel_version: "6.1"
       sub_level: ${{ inputs.sub_level }}
@@ -103,26 +182,29 @@ jobs:
       ksu_variant: ${{ inputs.kernelsu_variant }}
       ksu_branch: ${{ inputs.kernelsu_branch }}
       custom_ref: ${{ inputs.custom_ref || '' }}
+      version: ${{ inputs.version || '' }}
+      build_time: ${{ inputs.build_time || '' }}
 
-      # Gunyah 8 Gen 3 VMID 修复（本工作流的存在意义）
+      # Gunyah 8 Gen 3 VMID 修复（本入口的存在意义）
       use_gunyah: true
       gunyah_builtin_qcom_platform: ${{ inputs.gunyah_builtin_qcom_platform }}
 
-      # 其余可选功能：默认关闭，保持镜像尽量接近 GKI 基线
+      # 与 kernel-custom 一致的功能开关
       use_zram: ${{ inputs.use_zram }}
-      zram_full_algo: ${{ inputs.zram_full_algo || false }}
-      zram_extra_algos: ""
-      use_bbg: false
-      use_ddk: false
-      use_ntsync: false
-      use_networking: false
-      use_kpm: false
-      use_rekernel: false
-      supp_op: false
+      use_bbg: ${{ inputs.use_bbg }}
+      use_ddk: ${{ inputs.use_ddk }}
+      use_ntsync: ${{ inputs.use_ntsync || false }}
+      use_networking: ${{ inputs.use_networking || false }}
+      use_kpm: ${{ inputs.use_kpm }}
+      use_rekernel: ${{ inputs.use_rekernel || false }}
+      supp_op: ${{ inputs.supp_op || false }}
       enable_susfs: ${{ !inputs.cancel_susfs }}
       virtualization_support: ${{ inputs.virtualization_support || 'off' }}
-      custom_external_modules: ""
-      custom_kernel_options: ""
+      zram_full_algo: ${{ inputs.zram_full_algo || false }}
+      zram_extra_algos: ${{ inputs.zram_extra_algos || '' }}
+      kpm_password: ${{ inputs.kpm_password || '' }}
+      custom_external_modules: ${{ inputs.custom_external_modules || '' }}
+      custom_kernel_options: ${{ inputs.custom_kernel_options || '' }}
 
   get-ksu-manager:
     uses: ./.github/workflows/get-manager.yml
