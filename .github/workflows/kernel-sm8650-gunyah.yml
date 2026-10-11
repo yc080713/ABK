@@ -9,6 +9,11 @@
 #   1. android_version / kernel_version 固定为 android14 / 6.1（Gunyah VMID 修复只在这条线验证过）
 #   2. use_gunyah 固定为 true（本入口的存在意义），额外暴露 gunyah_builtin_qcom_platform
 #   3. 没有「修订版本 revision」：build.yml 只在 android12 生成 boot.img 时用到它，6.1 用不到
+#   4. 新增 download_manager：默认关闭 —— 上游 KernelSU 变体的 manager APK 产物经常缺失
+#      （SukiSU-Ultra 的 build-manager 最近几次跑都没有 artifact），下载失败会让整个 run 变红。
+#      关掉后内核照常编，需要 manager 时自己去上游 Release 下载匹配版本安装即可。
+#   5. 去掉了「自定义 ZRAM 算法」「自定义外部模块」两项（按需精简；build.yml 侧仍支持，
+#      其他入口如 kernel-custom 照旧可以传）。
 #
 # 补丁与前置条件见 patches/README.md。
 name: 内核构建 - SM8650 (8 Gen 3) Gunyah 修复
@@ -53,6 +58,11 @@ on:
           - Latest(最新)
           - Custom(自定义)
         default: Stable(标准)
+      download_manager:
+        description: "下载配套 KernelSU Manager APK（上游产物可能缺失，失败会让整个 run 变红；默认关）"
+        required: false
+        type: boolean
+        default: false
 
       # ==================== 可选配置 ====================
       custom_ref:
@@ -142,25 +152,15 @@ on:
         required: false
         type: boolean
         default: false
-      zram_extra_algos:
-        description: "自定义 ZRAM 算法（逗号分隔，如 lzo,lz4,deflate,zstd；6.12 会忽略 lz4k/lz4kd/lz4k_oplus）"
-        required: false
-        type: string
-        default: ""
 
       # ==================== KPM 扩展选项 ====================
       kpm_password:
-        description: "自定义 KPM 超级密码（留空=使用默认密码）"
+        description: "自定义 KPM 超级密码（留空=使用默认密码；建议设置，默认密码等于没有密码）"
         required: false
         type: string
         default: ""
 
-      # ==================== 自定义外部模块 ====================
-      custom_external_modules:
-        description: "自定义外部模块（兼容旧 repo;stage，也支持 module:repo;stage 与 set:repo#child;stage，用 | 分隔）"
-        required: false
-        type: string
-        default: ""
+      # ==================== 自定义内核选项 ====================
       custom_kernel_options:
         description: "自定义内核选项（每行一条 Kconfig/defconfig 片段）"
         required: false
@@ -201,12 +201,13 @@ jobs:
       enable_susfs: ${{ !inputs.cancel_susfs }}
       virtualization_support: ${{ inputs.virtualization_support || 'off' }}
       zram_full_algo: ${{ inputs.zram_full_algo || false }}
-      zram_extra_algos: ${{ inputs.zram_extra_algos || '' }}
       kpm_password: ${{ inputs.kpm_password || '' }}
-      custom_external_modules: ${{ inputs.custom_external_modules || '' }}
       custom_kernel_options: ${{ inputs.custom_kernel_options || '' }}
 
   get-ksu-manager:
+    # 默认不下载：上游 manager 产物缺失时该 job 会 exit 1，导致整个 run 变红。
+    # 需要配套 APK 时把 download_manager 打开；kernelsu_variant=None 时本来也不需要。
+    if: ${{ inputs.download_manager && inputs.kernelsu_variant != 'None' }}
     uses: ./.github/workflows/get-manager.yml
     secrets: inherit
     with:

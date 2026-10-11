@@ -3998,7 +3998,7 @@ jobs:
       - name: 配置 KPM 超级密码
         if: inputs.use_kpm && inputs.kpm_password != '' && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'BakaSU')
         run: |
-          echo "KPM 超级密码将在 Image KPM patch 阶段写入。"
+          echo "KPM 超级密码将在 Image KPM patch 阶段通过 kptools --reset-skey 写入。"
           echo "CONFIG_KPM_SUPER_KEY 不是当前 KSU Kconfig 符号，不能写入 defconfig fragment。"
 
       - name: 添加 SUSFS 配置
@@ -6663,10 +6663,43 @@ jobs:
           cd "$TARGET_PATH"
           chmod 777 patch
           patch_ok=true
-          if ! { if [ -n "$KPM_PASSWORD" ]; then ./patch -s "$KPM_PASSWORD"; else ./patch; fi; }; then
+
+          # 注意：patch_linux 这个 wrapper 的源码里把 superkey 写死成默认值（"123"），
+          # 而且不解析自己的命令行参数，所以 `./patch -s "<密码>"` 传进去的密码会被丢弃。
+          # 因此这里先用 wrapper 完成打补丁，再用官方 kptools --reset-skey 把超级密码
+          # 改成用户指定的值（不改的话内核里永远是默认的 123，等于没有密码）。
+          if ! ./patch; then
             patch_ok=false
           fi
           [ -f oImage ] || patch_ok=false
+
+          if [ "$patch_ok" = true ] && [ -n "$KPM_PASSWORD" ]; then
+            KPM_KPTOOLS="$SUKISU_PATCHES/kpm/kptools"
+            kpm_pw_bytes=$(printf %s "$KPM_PASSWORD" | wc -c)
+            echo "::add-mask::$KPM_PASSWORD"
+            if [ ! -f "$KPM_KPTOOLS" ]; then
+              echo "::error::未找到 kptools（$KPM_KPTOOLS），无法写入自定义 KPM 超级密码"
+              patch_ok=false
+            elif [ "$kpm_pw_bytes" -ge 64 ]; then
+              echo "::error::KPM 超级密码过长（${kpm_pw_bytes} 字节）；KernelPatch 限制必须小于 64 字节"
+              patch_ok=false
+            else
+              chmod 755 "$KPM_KPTOOLS" 2>/dev/null || true
+              # kptools 会打印 "reset superkey: <旧> -> <新>"，重定向到文件避免密码进日志
+              if ! "$KPM_KPTOOLS" -r -s "$KPM_PASSWORD" -i oImage -o oImage.rekey > "$TARGET_PATH/kpm-rekey.log" 2>&1; then
+                echo "::error::用 kptools 重置 KPM 超级密码失败（日志已按密码掩码后输出）"
+                cat "$TARGET_PATH/kpm-rekey.log" 2>/dev/null || true
+                patch_ok=false
+              elif [ ! -f oImage.rekey ]; then
+                echo "::error::kptools 未生成重置后的镜像 oImage.rekey"
+                patch_ok=false
+              else
+                mv -f oImage.rekey oImage
+                rm -f "$TARGET_PATH/kpm-rekey.log"
+                echo "KPM 超级密码已写入自定义值（wrapper 默认的 123 已被覆盖）"
+              fi
+            fi
+          fi
           if [ "$patch_ok" != true ]; then
             if [ "${{ inputs.source_mode }}" = "custom_git" ]; then
               mv "$image_backup" Image
