@@ -121,6 +121,21 @@ on:
         required: false
         type: boolean
         default: true
+      # ==================== 8 Gen 3 Gunyah VMID 修复 ====================
+      # 仅 SM8650 (骁龙 8 Gen 3) + android14/6.1 需要；开启后在内核编译前应用
+      # patches/0001-gunyah-fix-scm-vmid-gki-compat.patch
+      use_gunyah:
+        description: "应用 8 Gen 3 (SM8650) Gunyah VMID 修复"
+        required: false
+        type: boolean
+        default: false
+      # GKI gki_defconfig 默认 "# CONFIG_GUNYAH_QCOM_PLATFORM is not set"，
+      # 不打开时 gunyah_qcom.c 根本不参与编译，补丁只会停在源码里。
+      gunyah_builtin_qcom_platform:
+        description: "同时启用 CONFIG_GUNYAH_QCOM_PLATFORM=y（让 Gunyah 补丁真正编进 Image）"
+        required: false
+        type: boolean
+        default: false
       supp_op:
         required: false
         type: boolean
@@ -6292,6 +6307,79 @@ jobs:
           fi
 
           echo "ABK Control 管理器桥接校验通过。"
+
+      - name: 应用 Gunyah 8 Gen 3 VMID 修复补丁
+        if: inputs.use_gunyah
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          set -euo pipefail
+
+          ensure_defconfig_value() {
+            local cfg="$1"
+            local value="$2"
+            local line="${cfg}=${value}"
+
+            if grep -qxF "$line" "$DEFCONFIG"; then
+              return 0
+            fi
+
+            if grep -Eq "^${cfg}=|^# ${cfg} is not set$" "$DEFCONFIG"; then
+              sed -i -E "s|^${cfg}=.*|${line}|; s|^# ${cfg} is not set$|${line}|" "$DEFCONFIG"
+            else
+              echo "$line" >> "$DEFCONFIG"
+            fi
+          }
+
+          GUNYAH_FILE="drivers/virt/gunyah/gunyah_qcom.c"
+          PATCH_FILE="$GITHUB_WORKSPACE/patches/0001-gunyah-fix-scm-vmid-gki-compat.patch"
+
+          if [ ! -f "$GUNYAH_FILE" ]; then
+            echo "::warning::未找到 Gunyah 驱动 ($GUNYAH_FILE)，跳过补丁"
+            exit 0
+          fi
+
+          if grep -q "qcom_scm_map_vmid" "$GUNYAH_FILE"; then
+            echo "Gunyah SCM VMID 修复已应用，跳过"
+          else
+            if [ ! -f "$PATCH_FILE" ]; then
+              echo "::error::未找到 Gunyah VMID 修复补丁: $PATCH_FILE"
+              exit 1
+            fi
+            if git apply --check "$PATCH_FILE" 2>/dev/null; then
+              git apply "$PATCH_FILE"
+              echo "Gunyah SCM VMID 修复补丁应用成功"
+            else
+              echo "::error::Gunyah VMID 修复补丁无法应用，请检查内核源码版本是否匹配"
+              git apply --verbose "$PATCH_FILE" 2>&1 | head -30 || true
+              exit 1
+            fi
+          fi
+
+          # 补丁只改 gunyah_qcom.c，而 GKI gki_defconfig 默认把
+          # CONFIG_GUNYAH_QCOM_PLATFORM 关掉；这种情况下补丁不会进入 Image。
+          if grep -q '^CONFIG_GUNYAH_QCOM_PLATFORM=' "$DEFCONFIG"; then
+            echo "CONFIG_GUNYAH_QCOM_PLATFORM 已启用：$(grep '^CONFIG_GUNYAH_QCOM_PLATFORM=' "$DEFCONFIG")"
+          elif [ "${{ inputs.gunyah_builtin_qcom_platform }}" = "true" ]; then
+            ensure_defconfig_value CONFIG_GUNYAH_QCOM_PLATFORM y
+            echo "已写入 CONFIG_GUNYAH_QCOM_PLATFORM=y，补丁会编译进内核 Image"
+          else
+            echo "::warning::CONFIG_GUNYAH_QCOM_PLATFORM 未启用，补丁不会参与编译（gunyah_qcom.c 不在 GKI 构建列表里）。"
+            echo "::warning::若要让修复真正生效，请把 gunyah_builtin_qcom_platform 设为 true。"
+          fi
+
+          # Gunyah 核心（CONFIG_GUNYAH=y）保持 GKI 默认不动；
+          # 只有 CONFIG_GUNYAH_QCOM_PLATFORM 启用时，被补丁修改的
+          # gunyah_qcom.c 才会参与编译。
+          {
+            echo "### Gunyah 8 Gen 3 VMID 修复"
+            echo
+            echo "- use_gunyah: \`${{ inputs.use_gunyah }}\`"
+            echo "- gunyah_builtin_qcom_platform: \`${{ inputs.gunyah_builtin_qcom_platform }}\`"
+            echo "- 补丁: \`patches/0001-gunyah-fix-scm-vmid-gki-compat.patch\`"
+            echo "- defconfig: \`$(grep -E '^(CONFIG_GUNYAH_QCOM_PLATFORM=.*|# CONFIG_GUNYAH_QCOM_PLATFORM is not set)$' "$DEFCONFIG" || echo '(未找到该配置项)')\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Gunyah 8 Gen 3 SCM VMID 修复步骤完成"
 
       - name: 编译内核
         uses: nick-fields/retry@v4

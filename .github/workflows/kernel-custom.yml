@@ -143,6 +143,19 @@ on:
         type: boolean
         default: false
 
+      # ==================== 8 Gen 3 Gunyah VMID 修复 ====================
+      # 仅小米14 / Redmi K70 等 SM8650 (骁龙 8 Gen 3) + android14/6.1 需要
+      use_gunyah:
+        description: "应用 8 Gen 3 (SM8650) Gunyah VMID 修复（内核源码补丁）"
+        required: false
+        type: boolean
+        default: false
+      gunyah_builtin_qcom_platform:
+        description: "同时启用 CONFIG_GUNYAH_QCOM_PLATFORM=y（不开启则 gunyah_qcom.c 不编译，补丁无效）"
+        required: false
+        type: boolean
+        default: false
+
       # ==================== ZRAM 扩展选项 ====================
       zram_full_algo:
         description: "启用 ZRAM 完整算法支持（6.12 自动跳过 legacy LZ4K/LZ4KD/LZ4K_OPLUS）"
@@ -198,6 +211,8 @@ jobs:
       use_kpm: ${{ inputs.use_kpm }}
       use_rekernel: ${{ inputs.use_rekernel || false }}
       supp_op: ${{ inputs.supp_op || false }}
+      use_gunyah: ${{ inputs.use_gunyah || false }}
+      gunyah_builtin_qcom_platform: ${{ inputs.gunyah_builtin_qcom_platform || false }}
       enable_susfs: ${{ !inputs.cancel_susfs }}
       virtualization_support: ${{ inputs.virtualization_support || 'off' }}
       zram_full_algo: ${{ inputs.zram_full_algo || false }}
