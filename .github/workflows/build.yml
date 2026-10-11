@@ -6674,19 +6674,44 @@ jobs:
           [ -f oImage ] || patch_ok=false
 
           if [ "$patch_ok" = true ] && [ -n "$KPM_PASSWORD" ]; then
-            KPM_KPTOOLS="$SUKISU_PATCHES/kpm/kptools"
             kpm_pw_bytes=$(printf %s "$KPM_PASSWORD" | wc -c)
             echo "::add-mask::$KPM_PASSWORD"
-            if [ ! -f "$KPM_KPTOOLS" ]; then
-              echo "::error::未找到 kptools（$KPM_KPTOOLS），无法写入自定义 KPM 超级密码"
-              patch_ok=false
-            elif [ "$kpm_pw_bytes" -ge 64 ]; then
+            KPT=""
+            if [ "$kpm_pw_bytes" -ge 64 ]; then
               echo "::error::KPM 超级密码过长（${kpm_pw_bytes} 字节）；KernelPatch 限制必须小于 64 字节"
               patch_ok=false
             else
-              chmod 755 "$KPM_KPTOOLS" 2>/dev/null || true
-              # kptools 会打印 "reset superkey: <旧> -> <新>"，重定向到文件避免密码进日志
-              if ! "$KPM_KPTOOLS" -r -s "$KPM_PASSWORD" -i oImage -o oImage.rekey > "$TARGET_PATH/kpm-rekey.log" 2>&1; then
+              # SukiSU_patch 的 kpm/kptools 是 Android 版（aarch64 + /system/bin/linker64），
+              # 在 x86_64 runner 上会 Exec format error；patch_linux 里内嵌了一份同版本的
+              # x86_64 kptools，用脚本按 ELF 头抠出来（详见 .github/scripts/extract-kptools.py）
+              if python3 "$GITHUB_WORKSPACE/.github/scripts/extract-kptools.py" \
+                   "$SUKISU_PATCHES/kpm/patch_linux" "$TARGET_PATH/kptools-x86_64" \
+                 && "$TARGET_PATH/kptools-x86_64" -v > /dev/null 2>&1; then
+                KPT="$TARGET_PATH/kptools-x86_64"
+                echo "已从 patch_linux 提取可用的 x86_64 kptools"
+              fi
+
+              # 兜底：从 KernelPatch 源码编译 kptools（Makefile 需要静态 zlib）
+              if [ -z "$KPT" ]; then
+                echo "::warning::未能提取内嵌 kptools，改为从源码编译 kptools"
+                sudo apt-get install -y zlib1g-dev > /dev/null 2>&1 || true
+                rm -rf "$TARGET_PATH/kp-src"
+                if git clone --depth 1 https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch.git \
+                     "$TARGET_PATH/kp-src" > /dev/null 2>&1 \
+                   && make -C "$TARGET_PATH/kp-src/tools" -j"$(nproc)" > /dev/null 2>&1 \
+                   && "$TARGET_PATH/kp-src/tools/kptools" -v > /dev/null 2>&1; then
+                  KPT="$TARGET_PATH/kp-src/tools/kptools"
+                  echo "已从源码编译 kptools"
+                fi
+              fi
+
+              if [ -z "$KPT" ]; then
+                echo "::error::拿不到可在 x86_64 runner 上运行的 kptools，无法写入自定义 KPM 超级密码"
+                echo "::error::可以先把 kpm_password 留空（内核会保留默认的 123），或稍后重试"
+                patch_ok=false
+              elif ! "$KPT" -r -s "$KPM_PASSWORD" -i oImage -o oImage.rekey \
+                   > "$TARGET_PATH/kpm-rekey.log" 2>&1; then
+                # kptools 会打印 "reset superkey: <旧> -> <新>"，重定向到文件避免密码进日志
                 echo "::error::用 kptools 重置 KPM 超级密码失败（日志已按密码掩码后输出）"
                 cat "$TARGET_PATH/kpm-rekey.log" 2>/dev/null || true
                 patch_ok=false
