@@ -6393,22 +6393,29 @@ jobs:
           apply_gunyah_patch "$PATCH_DIR/0006-gunyah-chunk-scm-assign.patch" \
             "drivers/virt/gunyah/gunyah_qcom.c" "qcom_scm_assign_mem_chunked" "Gunyah SCM 分块调用" || exit 1
 
-          # 0001 只改 gunyah_qcom.c，而 GKI gki_defconfig 默认把
-          # CONFIG_GUNYAH_QCOM_PLATFORM 关掉；这种情况下它不会进入 Image。
+          # 0001 只改 gunyah_qcom.c。GKI gki_defconfig 默认关掉
+          # CONFIG_GUNYAH_QCOM_PLATFORM，那样补丁不会进入 Image；本步骤默认走
+          # 【模块模式】：写入 CONFIG_GUNYAH_QCOM_PLATFORM=m，把修复编译进
+          # gunyah_qcom.ko（=m 时 select 只会把 QCOM_SCM 定成 m，不内建），
+          # 产物里的 gunyah_qcom_module.zip 由 KernelSU 模块开机替换厂商模块 ——
+          # 不用刷内核、也不动 SCM 的模块化状态。
           if grep -q '^CONFIG_GUNYAH_QCOM_PLATFORM=' "$DEFCONFIG"; then
             GUNYAH_QCOM_LINE="$(grep '^CONFIG_GUNYAH_QCOM_PLATFORM=' "$DEFCONFIG")"
             echo "CONFIG_GUNYAH_QCOM_PLATFORM 已启用：$GUNYAH_QCOM_LINE"
             case "$GUNYAH_QCOM_LINE" in
               *=m)
                 echo "模块模式：VMID 修复会编译进 gunyah_qcom.ko（不内建，QCOM_SCM 只会被 select 成 =m），构建结束时会自动收集成产物"
+                echo "::notice::模块模式已启用：下载产物 gunyah_qcom_module.zip，用 SukiSU/KernelSU 管理器【从本地安装】后重启即可生效（无需刷内核）"
                 ;;
             esac
           elif [ "${{ inputs.gunyah_builtin_qcom_platform }}" = "true" ]; then
             ensure_defconfig_value CONFIG_GUNYAH_QCOM_PLATFORM y
             echo "已写入 CONFIG_GUNYAH_QCOM_PLATFORM=y，VMID 补丁会编译进内核 Image"
-            echo "::warning::注意：该开关会 select QCOM_SCM，把 SCM 从厂商模块变成内建（本设备上可能导致启动失败）"
+            echo "::warning::注意：该开关会 select QCOM_SCM，把 SCM 从厂商模块变成内建（本设备上实测启动崩溃，不建议使用）"
           else
-            echo "::warning::CONFIG_GUNYAH_QCOM_PLATFORM 未启用，VMID 补丁不会参与编译（kvcalloc 补丁不受影响，仍然生效）。"
+            ensure_defconfig_value CONFIG_GUNYAH_QCOM_PLATFORM m
+            echo "未显式配置，已默认写入 CONFIG_GUNYAH_QCOM_PLATFORM=m（模块模式）"
+            echo "::notice::模块模式已启用：下载产物 gunyah_qcom_module.zip，用 SukiSU/KernelSU 管理器【从本地安装】后重启即可生效（无需刷内核）"
           fi
 
           # 模块模式：必须把模块登记进 GKI 模块清单，否则 Kleaf 会报
@@ -6451,9 +6458,16 @@ jobs:
             echo
             echo "- use_gunyah: \`${{ inputs.use_gunyah }}\`"
             echo "- gunyah_builtin_qcom_platform: \`${{ inputs.gunyah_builtin_qcom_platform }}\`"
-            echo "- 0001 VMID 补丁: \`patches/0001-gunyah-fix-scm-vmid-gki-compat.patch\`（gunyah_qcom.c，需 CONFIG_GUNYAH_QCOM_PLATFORM）"
+            echo "- 0001 VMID 补丁: \`patches/0001-gunyah-fix-scm-vmid-gki-compat.patch\`（gunyah_qcom.c）"
             echo "- 0002 kvcalloc 补丁: \`patches/0002-gunyah-vm-mgr-mm-kvcalloc-large-guest.patch\`（vm_mgr_mm.c，CONFIG_GUNYAH=y 即生效）"
+            echo "- 0003 SCM 进度探针 / 0004 RM 清理修复 / 0005 条数保护 / 0006 SCM 分块"
             echo "- defconfig: \`$(grep -E '^(CONFIG_GUNYAH_QCOM_PLATFORM=.*|# CONFIG_GUNYAH_QCOM_PLATFORM is not set)$' "$DEFCONFIG" || echo '(未找到该配置项)')\`"
+            if grep -q '^CONFIG_GUNYAH_QCOM_PLATFORM=m' "$DEFCONFIG"; then
+              echo
+              echo "> **模块模式已启用**：下载产物 \`gunyah_qcom_module.zip\` → SukiSU/KernelSU 管理器 → 模块 → 从本地安装 → 重启。"
+              echo "> 无需刷内核；开机后 \`dmesg | grep gunyah_vmid\` 应显示 \`patched gunyah_qcom loaded\`，"
+              echo "> 且 \`/sys/module/gunyah_qcom/parameters/\` 下应出现 \`max_mem_entries\`、\`max_scm_chunk_mb\`。"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "Gunyah 8 Gen 3 修复步骤完成"

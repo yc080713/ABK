@@ -27,15 +27,15 @@ on:
     inputs:
       # ==================== 内核版本 ====================
       sub_level:
-        description: "子版本号 (6.1，如 118 / 138)"
+        description: "子版本号 (6.1，如 118 / 138) —— 默认 118（与本机一致）"
         required: true
         type: string
-        default: "138"
+        default: "118"
       os_patch_level:
-        description: "安全补丁级别 (需与子版本对应，如 2025-01 / 2025-06)"
+        description: "安全补丁级别 (需与子版本对应，如 2025-01 / 2025-06) —— 默认 2025-01"
         required: true
         type: string
-        default: "2025-06"
+        default: "2025-01"
 
       # ==================== KernelSU 配置 ====================
       kernelsu_variant:
@@ -93,11 +93,15 @@ on:
         default: "off"
 
       # ==================== Gunyah VMID 修复 ====================
+      # 本入口默认走"模块模式"：自动写入 CONFIG_GUNYAH_QCOM_PLATFORM=m，
+      # 修复编译进 gunyah_qcom.ko（产物里的 gunyah_qcom_module.zip），
+      # 由 KernelSU 模块在开机时替换厂商模块 —— 不内建、不动 QCOM_SCM、
+      # 也不需要刷内核。下面这个开关只在你想强行内建时才勾（实测会崩，别勾）。
       gunyah_builtin_qcom_platform:
-        description: "同时启用 CONFIG_GUNYAH_QCOM_PLATFORM=y（不开启则 gunyah_qcom.c 不编译，补丁无效）"
+        description: "【危险，别勾】改为内建 CONFIG_GUNYAH_QCOM_PLATFORM=y（会 select QCOM_SCM 把 SCM 变内建，本机实测启动崩溃）"
         required: false
         type: boolean
-        default: true
+        default: false
 
       # ==================== 功能开关 ====================
       use_zram:
@@ -161,8 +165,10 @@ on:
         default: ""
 
       # ==================== 自定义内核选项 ====================
+      # 注意：本入口已经自动注入 CONFIG_GUNYAH_QCOM_PLATFORM=m（模块模式），
+      # 这里只需要填"额外"要加/覆盖的选项，不用再写那一行。
       custom_kernel_options:
-        description: "自定义内核选项（每行一条 Kconfig/defconfig 片段）"
+        description: "额外的内核选项（每行一条 Kconfig/defconfig 片段；模块模式已内置，无需重复填写）"
         required: false
         type: string
         default: ""
@@ -202,7 +208,12 @@ jobs:
       virtualization_support: ${{ inputs.virtualization_support || 'off' }}
       zram_full_algo: ${{ inputs.zram_full_algo || false }}
       kpm_password: ${{ inputs.kpm_password || '' }}
-      custom_kernel_options: ${{ inputs.custom_kernel_options || '' }}
+
+      # 模块模式：默认写入 CONFIG_GUNYAH_QCOM_PLATFORM=m（编译出 gunyah_qcom.ko，
+      # 由 KernelSU 模块开机替换厂商模块）。用户自填的选项放在后面，可覆盖。
+      custom_kernel_options: |
+        CONFIG_GUNYAH_QCOM_PLATFORM=m
+        ${{ inputs.custom_kernel_options }}
 
   get-ksu-manager:
     # 默认不下载：上游 manager 产物缺失时该 job 会 exit 1，导致整个 run 变红。
