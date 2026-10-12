@@ -1,0 +1,205 @@
+name: Gunyah 模块单独构建（不编内核）
+
+# ============================================================================
+# 只编译 drivers/virt/gunyah/gunyah_qcom.ko（带 0001/0003/0005/0006 补丁），
+# 并打包成 KernelSU 模块 zip。全程不编译内核 Image，约 5~8 分钟
+# （完整内核构建要 15~20 分钟）。
+#
+# 适用场景：只改了 gunyah_qcom.c 的补丁（VMID 修复 / SCM 探针 / 条数保护 / SCM 分块）。
+# 如果改了 rsc_mgr_rpc.c（0004）或 vm_mgr_mm.c（0002），它们属于内核 Image，
+# 必须走「内核构建 - SM8650 (8 Gen 3) Gunyah 修复」重新编内核。
+#
+# 产物：gunyah_qcom.ko、gunyah_qcom_module.zip
+# 安装：SukiSU/KernelSU 管理器 → 模块 → 从本地安装 → 重启
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      sub_level:
+        description: "子版本号 (默认 118，须与设备内核一致)"
+        required: true
+        type: string
+        default: "118"
+      os_patch_level:
+        description: "安全补丁级别 (默认 2025-01，须与 device 内核一致)"
+        required: true
+        type: string
+        default: "2025-01"
+      kernel_ref:
+        description: "内核分支（留空 = deprecated/android14-6.1-<os_patch_level>）"
+        required: false
+        type: string
+        default: ""
+      max_scm_chunk_mb_default:
+        description: "写入模块参数的默认 SCM 分块大小(MB)，仅用于日志提示"
+        required: false
+        type: string
+        default: "32"
+
+jobs:
+  build-gunyah-module:
+    name: "gunyah_qcom.ko (${{ inputs.sub_level }}-${{ inputs.os_patch_level }})"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出 ABK 仓库
+        uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm bc flex bison libssl-dev libelf-dev \
+            python3 zip unzip cpio kmod
+
+      - name: 拉取内核源码（浅克隆，只用于编模块）
+        run: |
+          set -euo pipefail
+          REF="${{ inputs.kernel_ref }}"
+          if [ -z "$REF" ]; then
+            REF="deprecated/android14-6.1-${{ inputs.os_patch_level }}"
+          fi
+          echo "使用分支: $REF"
+          for i in 1 2 3; do
+            if git clone --depth 1 --branch "$REF" \
+                 https://android.googlesource.com/kernel/common \
+                 "$GITHUB_WORKSPACE/kernel-common"; then
+              break
+            fi
+            echo "clone 第 $i 次失败，重试…"; rm -rf "$GITHUB_WORKSPACE/kernel-common"; sleep 5
+          done
+          test -f "$GITHUB_WORKSPACE/kernel-common/drivers/virt/gunyah/gunyah_qcom.c"
+          echo "源码就绪: $(du -sh "$GITHUB_WORKSPACE/kernel-common" | cut -f1)"
+
+      - name: 应用 gunyah_qcom.c 相关补丁
+        working-directory: ${{ github.workspace }}/kernel-common
+        run: |
+          set -euo pipefail
+          PATCH_DIR="$GITHUB_WORKSPACE/patches"
+
+          apply_patch() {
+            local name="$1" marker="$2" label="$3" file="$PATCH_DIR/$1"
+            [ -f "$file" ] || { echo "::warning::缺少补丁 $name，跳过"; return 0; }
+            if grep -qF "$marker" drivers/virt/gunyah/gunyah_qcom.c; then
+              echo "$label 已应用，跳过"; return 0
+            fi
+            if git apply --check "$file" 2>/dev/null; then
+              git apply "$file"; echo "$label 应用成功"; return 0
+            fi
+            echo "::error::$label 无法应用"; git apply --verbose "$file" 2>&1 | head -20 || true
+            return 1
+          }
+
+          # 只应用会进 gunyah_qcom.ko 的补丁；0002(vm_mgr_mm.c)/0004(rsc_mgr_rpc.c) 属于内核 Image
+          apply_patch "0001-gunyah-fix-scm-vmid-gki-compat.patch"        "qcom_scm_map_vmid"          "0001 SCM VMID 修复"
+          apply_patch "0003-gunyah-scm-share-progress-logging.patch"     "gh_qcom: scm assign"        "0003 SCM 进度探针"
+          apply_patch "0005-gunyah-cap-scm-entry-count.patch"            "gh_qcom_max_mem_entries"    "0005 SCM 条数保护阀"
+          apply_patch "0006-gunyah-chunk-scm-assign.patch"               "qcom_scm_assign_mem_chunked" "0006 SCM 分块调用"
+
+          echo "--- 关键标记核对 ---"
+          grep -c "qcom_scm_map_vmid" drivers/virt/gunyah/gunyah_qcom.c || true
+          grep -c "qcom_scm_assign_mem_chunked" drivers/virt/gunyah/gunyah_qcom.c || true
+
+      - name: 配置内核树（modules_prepare，不编 Image）
+        working-directory: ${{ github.workspace }}/kernel-common
+        run: |
+          set -euo pipefail
+          export ARCH=arm64
+          export LLVM=1
+
+          make -s O=out gki_defconfig
+          ./scripts/config --file out/.config \
+            -m GUNYAH_QCOM_PLATFORM \
+            -m QCOM_SCM \
+            -e GUNYAH \
+            -e GUNYAH_PLATFORM_HOOKS
+          make -s O=out olddefconfig
+
+          echo "--- 关键配置 ---"
+          grep -E '^(CONFIG_GUNYAH|CONFIG_GUNYAH_QCOM_PLATFORM|CONFIG_QCOM_SCM|CONFIG_MODULE_SIG|CONFIG_MODVERSIONS)' out/.config || true
+
+          make -s -j"$(nproc)" O=out modules_prepare
+
+      - name: 编译 gunyah_qcom.ko
+        working-directory: ${{ github.workspace }}/kernel-common
+        run: |
+          set -euo pipefail
+          export ARCH=arm64
+          export LLVM=1
+          # 没有 Module.symvers（没编内核），modpost 会提示 no symbol version —— 允许
+          KBUILD_MODPOST_WARN=1 make -j"$(nproc)" O=out M=drivers/virt/gunyah modules
+
+          KO="$(find out -type f -name 'gunyah_qcom.ko' | head -n1)"
+          test -n "$KO" || { echo "::error::没有产出 gunyah_qcom.ko"; exit 1; }
+          echo "KO=$KO" >> "$GITHUB_ENV"
+          cp "$KO" "$GITHUB_WORKSPACE/gunyah_qcom.ko"
+          ls -l "$GITHUB_WORKSPACE/gunyah_qcom.ko"
+
+          echo "--- 产物校验（应能看到 0003/0005/0006 的标记串）---"
+          for s in "gh_qcom: scm assign" "max_mem_entries" "max_scm_chunk_mb" "拒绝 mem_share"; do
+            if strings "$GITHUB_WORKSPACE/gunyah_qcom.ko" | grep -qF "$s"; then
+              echo "  [OK] $s"
+            else
+              echo "  [!!] 缺少标记: $s"
+            fi
+          done
+          echo "--- vermagic ---"
+          strings "$GITHUB_WORKSPACE/gunyah_qcom.ko" | grep -E '^(vermagic|depends|name)=' || true
+
+      - name: 打包 KernelSU 模块
+        run: |
+          set -euo pipefail
+          MODDIR="$RUNNER_TEMP/gunyah_vmid"
+          rm -rf "$MODDIR"; mkdir -p "$MODDIR"
+          cp "$GITHUB_WORKSPACE/gunyah_qcom.ko" "$MODDIR/gunyah_qcom.ko"
+
+          printf '%s\n' \
+            'id=gunyah_vmid' \
+            'name=Gunyah SM8650 VMID Fix' \
+            "version=module-only-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ github.run_number }}" \
+            'versionCode=1' \
+            'author=ABK' \
+            'description=只替换 gunyah_qcom.ko 的 KernelSU 模块（不刷内核）；含 VMID 修复 + SCM 探针 + 条数保护 + SCM 分块' \
+            > "$MODDIR/module.prop"
+
+          printf '%s\n' \
+            '#!/system/bin/sh' \
+            '# 用打过补丁的 gunyah_qcom.ko 替换厂商模块' \
+            'MODDIR=${0%/*}' \
+            'KO="$MODDIR/gunyah_qcom.ko"' \
+            '[ -f "$KO" ] || exit 0' \
+            'i=0; while [ $i -lt 60 ]; do [ -d /sys/module/gunyah_qcom ] && break; i=$((i+1)); sleep 1; done' \
+            'rmmod gunyah_qcom 2>/dev/null' \
+            'if insmod "$KO" 2>/dev/null; then' \
+            '  echo "gunyah_vmid: patched gunyah_qcom loaded" > /dev/kmsg 2>/dev/null' \
+            'else' \
+            '  echo "gunyah_vmid: insmod failed" > /dev/kmsg 2>/dev/null' \
+            'fi' \
+            > "$MODDIR/post-fs-data.sh"
+
+          printf '%s\n' \
+            '# Gunyah gunyah_qcom.ko 模块（单独构建版）' \
+            '' \
+            '只包含 gunyah_qcom.ko，不含内核。安装后开机自动替换厂商模块。' \
+            '验证：' \
+            '  adb shell su -c "dmesg | grep gunyah_vmid"' \
+            '  adb shell su -c "ls /sys/module/gunyah_qcom/parameters/"' \
+            '  # 应列出 max_mem_entries 与 max_scm_chunk_mb' \
+            '回退：管理器里删除本模块并重启。' \
+            > "$MODDIR/README.md"
+
+          chmod 755 "$MODDIR/post-fs-data.sh" "$MODDIR/gunyah_qcom.ko"
+          python3 -c "import sys,zipfile,pathlib;src=pathlib.Path(sys.argv[1]);out=sys.argv[2];z=zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED);[z.write(p,p.name) for p in sorted(src.iterdir()) if p.is_file()];z.close()" \
+            "$MODDIR" "$GITHUB_WORKSPACE/gunyah_qcom_module.zip"
+          ls -l "$GITHUB_WORKSPACE/gunyah_qcom_module.zip"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v6
+        with:
+          name: gunyah_qcom_ko_${{ inputs.sub_level }}-${{ inputs.os_patch_level }}
+          path: |
+            gunyah_qcom.ko
+            gunyah_qcom_module.zip
+          compression-level: 9
