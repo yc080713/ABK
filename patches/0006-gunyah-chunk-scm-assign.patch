@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ABK <builder@users.noreply.github.com>
+Date: Mon, 13 Oct 2026 03:00:00 +0800
+Subject: [PATCH] gunyah_qcom: chunk qcom_scm_assign_mem() calls
+
+带 0003 探针在真机上抓到的第二种故障（与"entry 太多"相反的另一极端）：
+
+  [835.677] gunyah: mem_share label=525824 n_acl=2 n_mem=1
+  [835.677] gh_qcom: pre_mem_share label=525824 n_acl=2 n_mem=1
+  [835.677] gh_qcom: scm assign FAILED at 0/1 (label=525824,
+            phys=0x94b800000 size=0x17f200000): -22
+  [864.975] ... n_mem=3 → FAILED at 2/3, size=0x17e600000
+  [979.962] ... n_mem=5 → FAILED at 4/5, size=0x17de00000
+
+三次都是"最后那条 ~6.1GB 的 entry"被拒；而同一窗口拆成 416~1956 条
+3~17MB 的 entry 时全部成功。结论：单次 qcom_scm_assign_mem() 的范围有上限，
+guest 内存一旦完全连续（被合并成一条 6GB entry）就必然 -EINVAL。
+
+本补丁：
+- 新增 helper qcom_scm_assign_mem_chunked()：把 (phys,size) 按
+  max_scm_chunk_mb（默认 32MB，可用模块参数调整）切成多次 SCM 调用
+- pre_mem_share 主循环、错误回滚循环、post_mem_reclaim 循环全部改用它
+- 失败日志带上 chunk 大小，便于继续定位真实上限
+
+配合 0005（entry 数上限）后，两个极端都被覆盖：
+  entry 太少→每条太大   → 本补丁分块
+  entry 太多→SCM 太久    → 0005 拒绝 + cond_resched
+---
+ drivers/virt/gunyah/gunyah_qcom.c | 66 +++++++++++++++++++++++++++++++------
+ 1 file changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/virt/gunyah/gunyah_qcom.c b/drivers/virt/gunyah/gunyah_qcom.c
+index 598afbe..0e27e68 100644
+--- a/drivers/virt/gunyah/gunyah_qcom.c
++++ b/drivers/virt/gunyah/gunyah_qcom.c
+@@ -8,6 +8,7 @@
+ #include <linux/jiffies.h>
+ #include <linux/module.h>
+ #include <linux/qcom_scm.h>
++#include <linux/sizes.h>
+ #include <linux/types.h>
+ #include <linux/uuid.h>
+ 
+@@ -26,6 +27,41 @@ module_param_named(max_mem_entries, gh_qcom_max_mem_entries, uint, 0644);
+ MODULE_PARM_DESC(max_mem_entries,
+ 	"最多允许的 mem entry 数（每条 = 一次 SCM 调用），默认 16384");
+ 
++/*
++ * 真机实测：当 guest 内存完全连续、被合并成一条 ~6GB 的 mem entry 时，
++ * 单次 qcom_scm_assign_mem() 会直接返回 -EINVAL：
++ *   scm assign FAILED at 0/1 (label=525824, phys=0x94b800000 size=0x17f200000): -22
++ * （同一个窗口拆成 416~1956 条 3~17MB 的 entry 时都成功）
++ * 所以单次 SCM 的范围必须设上限，超出的部分切成多次调用。
++ * 可用模块参数覆盖： gh_qcom.max_scm_chunk_mb=N
++ */
++static unsigned int gh_qcom_max_scm_chunk_mb = 32;
++module_param_named(max_scm_chunk_mb, gh_qcom_max_scm_chunk_mb, uint, 0644);
++MODULE_PARM_DESC(max_scm_chunk_mb,
++	"单次 qcom_scm_assign_mem() 的最大范围(MB)，默认 32");
++
++static int qcom_scm_assign_mem_chunked(u64 phys, u64 size, u64 *src,
++				       struct qcom_scm_vmperm *perms, int n)
++{
++	u64 chunk = (u64)gh_qcom_max_scm_chunk_mb * SZ_1M;
++	u64 done;
++	int ret;
++
++	if (!chunk)
++		chunk = SZ_1M;
++
++	for (done = 0; done < size; done += chunk) {
++		u64 part = min_t(u64, size - done, chunk);
++		u64 src_cpy = *src;
++
++		ret = qcom_scm_assign_mem(phys + done, part, &src_cpy, perms, n);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ static u16 qcom_scm_map_vmid(u16 vmid)
+ {
+ 	if (vmid <= QCOM_SCM_MAX_MANAGED_VMID)
+@@ -94,14 +130,16 @@ static int qcom_scm_gh_rm_pre_mem_share(void *rm, struct gh_rm_mem_parcel *mem_p
+ 			pr_info("gh_qcom: scm assign %d/%zu (label=%u, %ums)\n",
+ 				i, mem_parcel->n_mem_entries, mem_parcel->label,
+ 				jiffies_to_msecs(jiffies - start));
+-		ret = qcom_scm_assign_mem(le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
+-						le64_to_cpu(mem_parcel->mem_entries[i].size),
+-						&src_cpy, new_perms, mem_parcel->n_acl_entries);
++		ret = qcom_scm_assign_mem_chunked(
++				le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
++				le64_to_cpu(mem_parcel->mem_entries[i].size),
++				&src_cpy, new_perms, mem_parcel->n_acl_entries);
+ 		if (ret) {
+-			pr_err("gh_qcom: scm assign FAILED at %d/%zu (label=%u, phys=%#llx size=%#llx): %d\n",
++			pr_err("gh_qcom: scm assign FAILED at %d/%zu (label=%u, phys=%#llx size=%#llx, chunk=%uMB): %d\n",
+ 				i, mem_parcel->n_mem_entries, mem_parcel->label,
+ 				le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
+-				le64_to_cpu(mem_parcel->mem_entries[i].size), ret);
++				le64_to_cpu(mem_parcel->mem_entries[i].size),
++				gh_qcom_max_scm_chunk_mb, ret);
+ 			break;
+ 		}
+ 	}
+@@ -123,7 +161,7 @@ static int qcom_scm_gh_rm_pre_mem_share(void *rm, struct gh_rm_mem_parcel *mem_p
+ 
+ 	for (i--; i >= 0; i--) {
+ 		src_cpy = src;
+-		WARN_ON_ONCE(qcom_scm_assign_mem(
++		WARN_ON_ONCE(qcom_scm_assign_mem_chunked(
+ 				le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
+ 				le64_to_cpu(mem_parcel->mem_entries[i].size),
+ 				&src_cpy, new_perms, 1));
+@@ -165,12 +203,14 @@ static int qcom_scm_gh_rm_post_mem_reclaim(void *rm, struct gh_rm_mem_parcel *me
+ 		src_cpy = src;
+ 		if (!(i & 0xff))
+ 			cond_resched();
+-		ret = qcom_scm_assign_mem(le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
+-						le64_to_cpu(mem_parcel->mem_entries[i].size),
+-						&src_cpy, &new_perms, 1);
++		ret = qcom_scm_assign_mem_chunked(
++				le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
++				le64_to_cpu(mem_parcel->mem_entries[i].size),
++				&src_cpy, &new_perms, 1);
+ 		if (ret)
+-			pr_warn("gh_qcom: scm reclaim failed at %d/%zu: %d\n",
+-				i, mem_parcel->n_mem_entries, ret);
++			pr_warn("gh_qcom: scm reclaim failed at %d/%zu (chunk=%uMB): %d\n",
++				i, mem_parcel->n_mem_entries,
++				gh_qcom_max_scm_chunk_mb, ret);
+ 	}
+ 
+ 	return ret;
