@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ABK <builder@users.noreply.github.com>
+Date: Mon, 13 Oct 2026 02:00:00 +0800
+Subject: [PATCH] gunyah_qcom: cap SCM entry count and reschedule in SCM loops
+
+真机实测（带 0003 探针）：
+
+  [365.5s] gh_qcom: pre_mem_share label=525824 n_acl=2 n_mem=82684
+  [372.8s] gh_qcom: scm assign 6656/82684 (label=525824, 7284ms)
+  [373.4s] gh_qcom: scm assign 7680/82684 (label=525824, 7896ms)
+  <系统挂死，看门狗硬复位；pstore 为空，无 panic>
+
+同一会话里前三次 share 只有 476 / 1956 / 416 条 entry（大页质量好，各 1~3 秒完成）；
+第四次 guest 内存碎片化，entry 暴涨到 82684 条 = 82684 次串行 SMC，
+按实测 ~1ms/条 需要 60~85 秒，整机被拖死。
+
+本补丁（module 侧，热加载即可）：
+- 新增模块参数 max_mem_entries（默认 16384），超过则拒绝本次 share
+  并打印原因 —— 把"整机挂死"降级为"VM 启动失败 + 明确日志"
+- entry > 4096 时打印告警
+- 两处 SCM 循环每 256 条 cond_resched()，避免长时间不可抢占
+---
+ drivers/virt/gunyah/gunyah_qcom.c | 45 +++++++++++++++++++++++++++++--
+ 1 file changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/virt/gunyah/gunyah_qcom.c b/drivers/virt/gunyah/gunyah_qcom.c
+index 8cab077..598afbe 100644
+--- a/drivers/virt/gunyah/gunyah_qcom.c
++++ b/drivers/virt/gunyah/gunyah_qcom.c
+@@ -14,6 +14,18 @@
+ #define QCOM_SCM_RM_MANAGED_VMID	0x3A
+ #define QCOM_SCM_MAX_MANAGED_VMID	0x3F
+ 
++/*
++ * 每条 mem entry 都要做一次 qcom_scm_assign_mem()（进安全世界的同步 SMC）。
++ * 真机实测：entry 数 ~500 时耗时 ~1s；一旦 guest 内存碎片化、entry 数涨到
++ * 8 万级，就会需要 60~85 秒串行 SMC —— 期间整机被拖死并触发看门狗硬复位。
++ * 超过本上限时直接拒绝这次 share（VM 启动失败），把"整机挂死"降级为"启动报错"。
++ * 可用模块参数覆盖： gh_qcom.max_mem_entries=N
++ */
++static unsigned int gh_qcom_max_mem_entries = 16384;
++module_param_named(max_mem_entries, gh_qcom_max_mem_entries, uint, 0644);
++MODULE_PARM_DESC(max_mem_entries,
++	"最多允许的 mem entry 数（每条 = 一次 SCM 调用），默认 16384");
++
+ static u16 qcom_scm_map_vmid(u16 vmid)
+ {
+ 	if (vmid <= QCOM_SCM_MAX_MANAGED_VMID)
+@@ -43,6 +55,19 @@ static int qcom_scm_gh_rm_pre_mem_share(void *rm, struct gh_rm_mem_parcel *mem_p
+ 		mem_parcel->label, mem_parcel->n_acl_entries,
+ 		mem_parcel->n_mem_entries);
+ 
++	if (mem_parcel->n_mem_entries > gh_qcom_max_mem_entries) {
++		pr_err("gh_qcom: 拒绝 mem_share: %zu 条 entry 超过上限 %u\n",
++		       mem_parcel->n_mem_entries, gh_qcom_max_mem_entries);
++		pr_err("gh_qcom: guest 内存严重碎片化；若继续执行需要约 %zu 秒串行 SMC，会把整机拖死。\n",
++		       mem_parcel->n_mem_entries / 1000);
++		pr_err("gh_qcom: 请重启手机后重试、降低 VM 内存，或启用大页预留池。\n");
++		return -EINVAL;
++	}
++
++	if (mem_parcel->n_mem_entries > 4096)
++		pr_warn("gh_qcom: entry 数偏多(%zu)，本次 SCM 阶段预计数百毫秒~数秒\n",
++			mem_parcel->n_mem_entries);
++
+ 	new_perms = kcalloc(mem_parcel->n_acl_entries, sizeof(*new_perms), GFP_KERNEL);
+ 	if (!new_perms)
+ 		return -ENOMEM;
+@@ -63,6 +88,8 @@ static int qcom_scm_gh_rm_pre_mem_share(void *rm, struct gh_rm_mem_parcel *mem_p
+ 	start = jiffies;
+ 	for (i = 0; i < mem_parcel->n_mem_entries; i++) {
+ 		src_cpy = src;
++		if (!(i & 0xff))
++			cond_resched();
+ 		if (!(i % 256))
+ 			pr_info("gh_qcom: scm assign %d/%zu (label=%u, %ums)\n",
+ 				i, mem_parcel->n_mem_entries, mem_parcel->label,
+@@ -136,6 +163,8 @@ static int qcom_scm_gh_rm_post_mem_reclaim(void *rm, struct gh_rm_mem_parcel *me
+ 
+ 	for (i = 0; i < mem_parcel->n_mem_entries; i++) {
+ 		src_cpy = src;
++		if (!(i & 0xff))
++			cond_resched();
+ 		ret = qcom_scm_assign_mem(le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
+ 						le64_to_cpu(mem_parcel->mem_entries[i].size),
+ 						&src_cpy, &new_perms, 1);
