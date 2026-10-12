@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ABK <builder@users.noreply.github.com>
+Date: Mon, 13 Oct 2026 00:00:00 +0800
+Subject: [PATCH] gunyah_qcom: log SCM assign/reclaim scale and progress
+
+大内存 guest（8-10GB、2MB 大页）会产生数千条 mem entry，而
+qcom_scm_assign_mem() 对每条 entry 单独做一次 SMC。分享阶段一旦挂死，
+现有代码没有任何输出，无法判断进度与规模。
+
+本补丁只加日志（不改行为）：
+- 进入 pre_mem_share 时打印 label / n_acl / n_mem
+- 每 256 条打印一次进度与耗时
+- 失败时打印失败位置、phys/size 与返回值
+- post_mem_reclaim 同样打印规模与失败明细
+
+该文件在模块模式（CONFIG_GUNYAH_QCOM_PLATFORM=m）下编译为
+gunyah_qcom.ko，可热加载验证，无需重新刷内核。
+---
+ drivers/virt/gunyah/gunyah_qcom.c | 45 ++++++++++++++++++++++++++++++---------
+ 1 file changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/virt/gunyah/gunyah_qcom.c b/drivers/virt/gunyah/gunyah_qcom.c
+index eb1749a..8cab077 100644
+--- a/drivers/virt/gunyah/gunyah_qcom.c
++++ b/drivers/virt/gunyah/gunyah_qcom.c
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/arm-smccc.h>
+ #include <linux/gunyah_rsc_mgr.h>
++#include <linux/jiffies.h>
+ #include <linux/module.h>
+ #include <linux/qcom_scm.h>
+ #include <linux/types.h>
+@@ -27,11 +28,21 @@ static int qcom_scm_gh_rm_pre_mem_share(void *rm, struct gh_rm_mem_parcel *mem_p
+ 	u64 src, src_cpy;
+ 	int ret = 0, i, n;
+ 	u16 self_vmid, vmid;
++	unsigned long start;
+ 
+ 	ret = gh_rm_get_vmid(rm, &self_vmid);
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * 大内存 guest（8-10GB）在 2MB 大页下会产生数千条 mem entry，
++	 * 每条都要做一次 SMC（qcom_scm_assign_mem）。把规模先打出来，
++	 * 分享阶段一旦挂死，日志能直接指出规模与进度。
++	 */
++	pr_info("gh_qcom: pre_mem_share label=%u n_acl=%zu n_mem=%zu\n",
++		mem_parcel->label, mem_parcel->n_acl_entries,
++		mem_parcel->n_mem_entries);
++
+ 	new_perms = kcalloc(mem_parcel->n_acl_entries, sizeof(*new_perms), GFP_KERNEL);
+ 	if (!new_perms)
+ 		return -ENOMEM;
+@@ -49,17 +60,31 @@ static int qcom_scm_gh_rm_pre_mem_share(void *rm, struct gh_rm_mem_parcel *mem_p
+ 
+ 	src = BIT_ULL(qcom_scm_map_vmid(self_vmid));
+ 
++	start = jiffies;
+ 	for (i = 0; i < mem_parcel->n_mem_entries; i++) {
+ 		src_cpy = src;
++		if (!(i % 256))
++			pr_info("gh_qcom: scm assign %d/%zu (label=%u, %ums)\n",
++				i, mem_parcel->n_mem_entries, mem_parcel->label,
++				jiffies_to_msecs(jiffies - start));
+ 		ret = qcom_scm_assign_mem(le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
+ 						le64_to_cpu(mem_parcel->mem_entries[i].size),
+ 						&src_cpy, new_perms, mem_parcel->n_acl_entries);
+-		if (ret)
++		if (ret) {
++			pr_err("gh_qcom: scm assign FAILED at %d/%zu (label=%u, phys=%#llx size=%#llx): %d\n",
++				i, mem_parcel->n_mem_entries, mem_parcel->label,
++				le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
++				le64_to_cpu(mem_parcel->mem_entries[i].size), ret);
+ 			break;
++		}
+ 	}
+ 
+-	if (!ret)
++	if (!ret) {
++		pr_info("gh_qcom: scm assign done %zu entries in %ums (label=%u)\n",
++			mem_parcel->n_mem_entries,
++			jiffies_to_msecs(jiffies - start), mem_parcel->label);
+ 		goto out;
++	}
+ 
+ 	src = 0;
+ 	for (n = 0; n < mem_parcel->n_acl_entries; n++) {
+@@ -93,6 +118,9 @@ static int qcom_scm_gh_rm_post_mem_reclaim(void *rm, struct gh_rm_mem_parcel *me
+ 	if (ret)
+ 		return ret;
+ 
++	pr_info("gh_qcom: post_mem_reclaim label=%u n_mem=%zu\n",
++		mem_parcel->label, mem_parcel->n_mem_entries);
++
+ 	/*
+ 	 * After reclaim, ownership must be restored to HLOS. Using the current
+ 	 * RM VMID here can make the SCM assign step reject the transfer on some
+@@ -111,7 +139,9 @@ static int qcom_scm_gh_rm_post_mem_reclaim(void *rm, struct gh_rm_mem_parcel *me
+ 		ret = qcom_scm_assign_mem(le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
+ 						le64_to_cpu(mem_parcel->mem_entries[i].size),
+ 						&src_cpy, &new_perms, 1);
+-		WARN_ON_ONCE(ret);
++		if (ret)
++			pr_warn("gh_qcom: scm reclaim failed at %d/%zu: %d\n",
++				i, mem_parcel->n_mem_entries, ret);
+ 	}
+ 
+ 	return ret;

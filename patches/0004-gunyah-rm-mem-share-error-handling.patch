@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ABK <builder@users.noreply.github.com>
+Date: Mon, 13 Oct 2026 00:00:00 +0800
+Subject: [PATCH] gunyah: fix RM mem parcel leak when mem_append fails
+
+gh_rm_mem_lend_common() 在 MEM_APPEND 失败时的清理有缺陷：
+
+    ret = gh_rm_mem_append(...);
+    if (ret) {
+        gh_rm_mem_reclaim(rm, p);        /* 返回值被忽略 */
+        p->mem_handle = GH_MEM_HANDLE_INVAL;   /* 无条件丢弃 handle */
+    }
+
+如果这次 reclaim 也被 RM 拒绝（真机上实测 -EINVAL，见 crosvm 报
+"Invalid argument (os error 22)"），handle 就被永久丢弃：RM 侧那条
+parcel 再也没法被释放，之后同一段 GPA 的 share 会被 RM 一直拒绝，
+直到重启。DroidVM 的 gunyah_share 模块日志
+"crosvm is gone but the RM still refuses label=... (-22)"
+正是这个状态。
+
+本补丁：
+- reclaim 最多重试 3 次（间隔 20ms）
+- 只有 reclaim 成功才把 mem_handle 置为 GH_MEM_HANDLE_INVAL
+- reclaim 失败时保留 handle，并打印明确错误（label/handle/n_mem）
+- 在 share/lend/pre-hook/RPC/reclaim 各失败点补日志，便于定位
+
+patch 0001（VMID 修复）之后应用。
+---
+ drivers/virt/gunyah/rsc_mgr_rpc.c | 62 ++++++++++++++++++++++++++++++++-------
+ 1 file changed, 51 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/virt/gunyah/rsc_mgr_rpc.c b/drivers/virt/gunyah/rsc_mgr_rpc.c
+index 3deb2e4..e8a2fae 100644
+--- a/drivers/virt/gunyah/rsc_mgr_rpc.c
++++ b/drivers/virt/gunyah/rsc_mgr_rpc.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/gunyah_rsc_mgr.h>
+ #include "rsc_mgr.h"
+ 
+@@ -197,6 +198,10 @@ static int gh_rm_mem_lend_common(struct gh_rm *rm, u32 message_id, struct gh_rm_
+ 	    p->n_acl_entries > U8_MAX || p->mem_handle != GH_MEM_HANDLE_INVAL)
+ 		return -EINVAL;
+ 
++	pr_info("gunyah: %s label=%u n_acl=%zu n_mem=%zu\n",
++		message_id == GH_RM_RPC_MEM_SHARE ? "mem_share" : "mem_lend",
++		p->label, p->n_acl_entries, p->n_mem_entries);
++
+ 	if (initial_mem_entries > GH_RM_MAX_MEM_ENTRIES)
+ 		initial_mem_entries = GH_RM_MAX_MEM_ENTRIES;
+ 
+@@ -219,6 +224,8 @@ static int gh_rm_mem_lend_common(struct gh_rm *rm, u32 message_id, struct gh_rm_
+ 
+ 	ret = gh_rm_platform_pre_mem_share(rm, p);
+ 	if (ret) {
++		pr_err("gunyah: pre_mem_share failed (label=%u n_mem=%zu): %d\n",
++		       p->label, p->n_mem_entries, ret);
+ 		kfree(msg);
+ 		return ret;
+ 	}
+@@ -248,6 +255,9 @@ static int gh_rm_mem_lend_common(struct gh_rm *rm, u32 message_id, struct gh_rm_
+ 	kfree(msg);
+ 
+ 	if (ret) {
++		pr_err("gunyah: %s RPC failed (label=%u n_mem=%zu): %d\n",
++		       message_id == GH_RM_RPC_MEM_SHARE ? "mem_share" : "mem_lend",
++		       p->label, p->n_mem_entries, ret);
+ 		gh_rm_platform_post_mem_reclaim(rm, p);
+ 		return ret;
+ 	}
+@@ -260,8 +270,30 @@ static int gh_rm_mem_lend_common(struct gh_rm *rm, u32 message_id, struct gh_rm_
+ 					&p->mem_entries[initial_mem_entries],
+ 					p->n_mem_entries - initial_mem_entries);
+ 		if (ret) {
+-			gh_rm_mem_reclaim(rm, p);
+-			p->mem_handle = GH_MEM_HANDLE_INVAL;
++			int cret, tries;
++
++			pr_err("gunyah: mem_append failed (label=%u handle=%#x entries=%zu): %d; reclaiming\n",
++			       p->label, p->mem_handle, p->n_mem_entries, ret);
++
++			for (tries = 0, cret = -EINVAL; tries < 3; tries++) {
++				cret = gh_rm_mem_reclaim(rm, p);
++				if (!cret)
++					break;
++				msleep(20);
++			}
++
++			if (cret) {
++				/*
++				 * RM 侧这条 parcel 还挂着（handle 已拿到，但
++				 * append 失败）。这里必须保留 handle，否则
++				 * 后续任何 reclaim 都无从发起，同一段 GPA 会
++				 * 永远被 RM 以 -EINVAL 拒绝。
++				 */
++				pr_err("gunyah: mem_reclaim failed too (label=%u handle=%#x): %d; keeping handle\n",
++				       p->label, p->mem_handle, cret);
++			} else {
++				p->mem_handle = GH_MEM_HANDLE_INVAL;
++			}
+ 		}
+ 	}
+ 
+@@ -309,8 +341,11 @@ int gh_rm_mem_reclaim(struct gh_rm *rm, struct gh_rm_mem_parcel *parcel)
+ 
+ 	ret = gh_rm_call(rm, GH_RM_RPC_MEM_RECLAIM, &req, sizeof(req), NULL, NULL);
+ 	/* Only call the platform mem reclaim hooks if we reclaimed the memory */
+-	if (ret)
++	if (ret) {
++		pr_warn("gunyah: MEM_RECLAIM failed (label=%u handle=%#x n_mem=%zu): %d\n",
++			parcel->label, parcel->mem_handle, parcel->n_mem_entries, ret);
+ 		return ret;
++	}
+ 
+ 	return gh_rm_platform_post_mem_reclaim(rm, parcel);
+ }
