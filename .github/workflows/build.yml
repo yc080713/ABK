@@ -6392,6 +6392,41 @@ jobs:
             echo "::warning::CONFIG_GUNYAH_QCOM_PLATFORM 未启用，VMID 补丁不会参与编译（kvcalloc 补丁不受影响，仍然生效）。"
           fi
 
+          # 模块模式：必须把模块登记进 GKI 模块清单，否则 Kleaf 会报
+          # "The following kernel modules are built but not copied"
+          # （清单来自 common/modules.bzl 的 _ARM64_GKI_MODULES_LIST，
+          #   kernel_aarch64 的 module_implicit_outs 就是它）
+          if grep -q '^CONFIG_GUNYAH_QCOM_PLATFORM=m' "$DEFCONFIG"; then
+            MODULES_BZL="$KERNEL_ROOT/common/modules.bzl"
+            if [ -f "$MODULES_BZL" ]; then
+          python3 - "$MODULES_BZL" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          wanted = [
+              "drivers/firmware/qcom-scm.ko",
+              "drivers/virt/gunyah/gunyah_qcom.ko",
+          ]
+          missing = [m for m in wanted if '"%s"' % m not in text]
+          if not missing:
+              print("modules.bzl: 模块已登记，跳过")
+          else:
+              match = re.search(r"(?m)^_ARM64_GKI_MODULES_LIST\s*=\s*\[", text)
+              if not match:
+                  print("::error::modules.bzl 里找不到 _ARM64_GKI_MODULES_LIST，无法登记模块")
+                  sys.exit(1)
+              block = "".join('\n    "%s",' % m for m in missing)
+              path.write_text(text[:match.end()] + block + text[match.end():])
+              print("modules.bzl: 已登记 " + ", ".join(missing))
+          PY
+            else
+              echo "::warning::未找到 common/modules.bzl，模块不会被 Kleaf 收集"
+            fi
+          fi
+
           {
             echo "### Gunyah 8 Gen 3 修复"
             echo
@@ -6847,7 +6882,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          KO="$(find "$KERNEL_ROOT/out" -type f -name 'gunyah_qcom.ko' 2>/dev/null | head -n 1 || true)"
+          SEARCH_DIRS=()
+          for d in "$KERNEL_ROOT/bazel-bin" "$KERNEL_ROOT/out" "$KERNEL_ROOT/dist"; do
+            if [ -e "$d" ]; then
+              SEARCH_DIRS+=("$(readlink -f "$d")")
+            fi
+          done
+          if [ ${#SEARCH_DIRS[@]} -eq 0 ]; then
+            SEARCH_DIRS=("$KERNEL_ROOT")
+          fi
+
+          KO="$(find "${SEARCH_DIRS[@]}" -type f -name 'gunyah_qcom.ko' 2>/dev/null | head -n 1 || true)"
 
           if [ -z "$KO" ]; then
             echo "本次构建没有产出 gunyah_qcom.ko（CONFIG_GUNYAH_QCOM_PLATFORM 不是 m）"
