@@ -6389,6 +6389,10 @@ jobs:
           apply_gunyah_patch "$PATCH_DIR/0005-gunyah-cap-scm-entry-count.patch" \
             "drivers/virt/gunyah/gunyah_qcom.c" "gh_qcom_max_mem_entries" "Gunyah SCM 条数保护阀" || exit 1
 
+          # 0006: 大 entry 分块做 SCM 调用（guest 内存完全连续时，单次 6GB 调用会被拒 -22）
+          apply_gunyah_patch "$PATCH_DIR/0006-gunyah-chunk-scm-assign.patch" \
+            "drivers/virt/gunyah/gunyah_qcom.c" "qcom_scm_assign_mem_chunked" "Gunyah SCM 分块调用" || exit 1
+
           # 0001 只改 gunyah_qcom.c，而 GKI gki_defconfig 默认把
           # CONFIG_GUNYAH_QCOM_PLATFORM 关掉；这种情况下它不会进入 Image。
           if grep -q '^CONFIG_GUNYAH_QCOM_PLATFORM=' "$DEFCONFIG"; then
