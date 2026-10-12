@@ -6384,6 +6384,11 @@ jobs:
           apply_gunyah_patch "$PATCH_DIR/0004-gunyah-rm-mem-share-error-handling.patch" \
             "drivers/virt/gunyah/rsc_mgr_rpc.c" "gunyah: mem_append failed" "Gunyah RM share 失败清理修复" || exit 1
 
+          # 0005: SCM 条目数上限保护（把"整机挂死"降级为"VM 启动失败 + 明确日志"）
+          #       + SCM 循环内 cond_resched（模块模式随机加载，无需刷内核）
+          apply_gunyah_patch "$PATCH_DIR/0005-gunyah-cap-scm-entry-count.patch" \
+            "drivers/virt/gunyah/gunyah_qcom.c" "gh_qcom_max_mem_entries" "Gunyah SCM 条数保护阀" || exit 1
+
           # 0001 只改 gunyah_qcom.c，而 GKI gki_defconfig 默认把
           # CONFIG_GUNYAH_QCOM_PLATFORM 关掉；这种情况下它不会进入 Image。
           if grep -q '^CONFIG_GUNYAH_QCOM_PLATFORM=' "$DEFCONFIG"; then
