@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Johnny <andy.wu.cyut.edu@gmail.com>
+Date: Sat, 21 Mar 2026 15:04:21 +0800
+Subject: [PATCH] gunyah: use kvcalloc/kvfree for large guest memory mappings
+
+上游 Andy312432/android_kernel_samsung_sm8650_gunyah 的
+3d8767092fa186b77dfcbc5fd14b53ae17b04bb2 ("fix: large memory access") 的
+GKI 适配版：大内存 VM 的 pinned-page 指针数组 / mem_entries 改用 kvcalloc
+（vmalloc 兜底），避免高 order kmalloc 失败让 gh_vm_mem_alloc() 返回 -ENOMEM
+（DroidVM 报 Out of memory, os error 12）。
+
+与上游版本的唯一区别：补了一行 #include <linux/slab.h> —— 在本分支
+(android14-6.1) 里 kvcalloc()/kvfree() 的声明位于 include/linux/slab.h，
+而 vm_mgr_mm.c 原本只 include 了 linux/mm.h。
+
+基于: https://github.com/Andy312432/android_kernel_samsung_sm8650_gunyah
+Fixes: DroidVM Out of memory (os error 12) on large guests
+---
+ drivers/virt/gunyah/vm_mgr_mm.c | 19 ++++++++++++-------
+ 1 file changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/virt/gunyah/vm_mgr_mm.c b/drivers/virt/gunyah/vm_mgr_mm.c
+index f7ddfd8..bda2598 100644
+--- a/drivers/virt/gunyah/vm_mgr_mm.c
++++ b/drivers/virt/gunyah/vm_mgr_mm.c
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/gunyah_rsc_mgr.h>
+ #include <linux/mm.h>
++#include <linux/slab.h>
+ 
+ #include <uapi/linux/gunyah.h>
+ 
+@@ -54,9 +55,9 @@ static void gh_vm_mem_reclaim_mapping(struct gh_vm *ghvm, struct gh_vm_mem *mapp
+ 		account_locked_vm(ghvm->mm, mapping->npages, false);
+ 	}
+ 
+-	kfree(mapping->pages);
++	kvfree(mapping->pages);
+ 	kfree(mapping->parcel.acl_entries);
+-	kfree(mapping->parcel.mem_entries);
++	kvfree(mapping->parcel.mem_entries);
+ 
+ 	list_del(&mapping->list);
+ }
+@@ -148,7 +149,12 @@ int gh_vm_mem_alloc(struct gh_vm *ghvm, struct gh_userspace_memory_region *regio
+ 	if (ret)
+ 		goto free_mapping;
+ 
+-	mapping->pages = kcalloc(mapping->npages, sizeof(*mapping->pages), GFP_KERNEL_ACCOUNT);
++	/*
++	 * Large guests can require hundreds of KiB just for the pinned-page
++	 * pointer array; use vmalloc fallback rather than high-order kmalloc.
++	 */
++	mapping->pages = kvcalloc(mapping->npages, sizeof(*mapping->pages),
++				  GFP_KERNEL_ACCOUNT);
+ 	if (!mapping->pages) {
+ 		ret = -ENOMEM;
+ 		mapping->npages = 0; /* update npages for reclaim */
+@@ -212,7 +218,7 @@ int gh_vm_mem_alloc(struct gh_vm *ghvm, struct gh_userspace_memory_region *regio
+ 			parcel->n_mem_entries++;
+ 	}
+ 
+-	parcel->mem_entries = kcalloc(parcel->n_mem_entries,
++	parcel->mem_entries = kvcalloc(parcel->n_mem_entries,
+ 					sizeof(parcel->mem_entries[0]),
+ 					GFP_KERNEL_ACCOUNT);
+ 	if (!parcel->mem_entries) {
+@@ -248,7 +254,7 @@ free_acl:
+ unpin_pages:
+ 	unpin_user_pages(mapping->pages, pinned);
+ free_pages:
+-	kfree(mapping->pages);
++	kvfree(mapping->pages);
+ unlock_pages:
+ 	account_locked_vm(ghvm->mm, mapping->npages, false);
+ free_mapping:
