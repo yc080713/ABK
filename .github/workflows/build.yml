@@ -6377,7 +6377,13 @@ jobs:
           # 0001 只改 gunyah_qcom.c，而 GKI gki_defconfig 默认把
           # CONFIG_GUNYAH_QCOM_PLATFORM 关掉；这种情况下它不会进入 Image。
           if grep -q '^CONFIG_GUNYAH_QCOM_PLATFORM=' "$DEFCONFIG"; then
-            echo "CONFIG_GUNYAH_QCOM_PLATFORM 已启用：$(grep '^CONFIG_GUNYAH_QCOM_PLATFORM=' "$DEFCONFIG")"
+            GUNYAH_QCOM_LINE="$(grep '^CONFIG_GUNYAH_QCOM_PLATFORM=' "$DEFCONFIG")"
+            echo "CONFIG_GUNYAH_QCOM_PLATFORM 已启用：$GUNYAH_QCOM_LINE"
+            case "$GUNYAH_QCOM_LINE" in
+              *=m)
+                echo "模块模式：VMID 修复会编译进 gunyah_qcom.ko（不内建，QCOM_SCM 只会被 select 成 =m），构建结束时会自动收集成产物"
+                ;;
+            esac
           elif [ "${{ inputs.gunyah_builtin_qcom_platform }}" = "true" ]; then
             ensure_defconfig_value CONFIG_GUNYAH_QCOM_PLATFORM y
             echo "已写入 CONFIG_GUNYAH_QCOM_PLATFORM=y，VMID 补丁会编译进内核 Image"
@@ -6836,6 +6842,83 @@ jobs:
           $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
           cp ./boot-lz4.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-lz4.img
 
+      - name: 收集 Gunyah 平台模块（模块模式）
+        if: inputs.use_gunyah
+        run: |
+          set -euo pipefail
+
+          KO="$(find "$KERNEL_ROOT/out" -type f -name 'gunyah_qcom.ko' 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$KO" ]; then
+            echo "本次构建没有产出 gunyah_qcom.ko（CONFIG_GUNYAH_QCOM_PLATFORM 不是 m）"
+            echo "::notice::如需「模块版」Gunyah VMID 修复：在 custom_kernel_options 填 CONFIG_GUNYAH_QCOM_PLATFORM=m，并让 gunyah_builtin_qcom_platform 留空"
+            exit 0
+          fi
+
+          echo "找到模块: $KO ($(stat -c %s "$KO") 字节)"
+          cp "$KO" "$GITHUB_WORKSPACE/gunyah_qcom.ko"
+          if command -v strings >/dev/null 2>&1; then
+            strings "$GITHUB_WORKSPACE/gunyah_qcom.ko" | grep -E '^(vermagic|depends|name|srcversion)=' || true
+          fi
+
+          MODDIR="$RUNNER_TEMP/gunyah_vmid"
+          rm -rf "$MODDIR"
+          mkdir -p "$MODDIR"
+          cp "$GITHUB_WORKSPACE/gunyah_qcom.ko" "$MODDIR/gunyah_qcom.ko"
+
+          printf '%s\n' \
+            'id=gunyah_vmid' \
+            'name=Gunyah SM8650 VMID Fix' \
+            "version=${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}" \
+            'versionCode=1' \
+            'author=ABK' \
+            'description=开机后用打过 SCM VMID 修复补丁的 gunyah_qcom.ko 替换厂商模块（不刷机、不改分区）' \
+            > "$MODDIR/module.prop"
+
+          printf '%s\n' \
+            '#!/system/bin/sh' \
+            '# 用打过 SCM VMID 修复补丁的 gunyah_qcom.ko 替换厂商模块' \
+            'MODDIR=${0%/*}' \
+            'KO="$MODDIR/gunyah_qcom.ko"' \
+            '[ -f "$KO" ] || exit 0' \
+            '# 等厂商模块（vendor_boot ramdisk）加载完成' \
+            'i=0; while [ $i -lt 60 ]; do [ -d /sys/module/gunyah_qcom ] && break; i=$((i+1)); sleep 1; done' \
+            'rmmod gunyah_qcom 2>/dev/null' \
+            'if insmod "$KO" 2>/dev/null; then' \
+            '  echo "gunyah_vmid: patched gunyah_qcom loaded" > /dev/kmsg 2>/dev/null' \
+            'else' \
+            '  echo "gunyah_vmid: insmod failed" > /dev/kmsg 2>/dev/null' \
+            'fi' \
+            > "$MODDIR/post-fs-data.sh"
+
+          printf '%s\n' \
+            '# Gunyah SM8650 VMID 修复模块' \
+            '' \
+            '作用：开机后用打过补丁的 gunyah_qcom.ko 替换厂商模块（厂商模块 refcnt 为 0，可卸载）。' \
+            '本模块不修改任何分区，卸载后重启即恢复原状。' \
+            '' \
+            '## 手动验证（推荐先做这一步）' \
+            '```sh' \
+            'su -c "rmmod gunyah_qcom; insmod /data/adb/modules/gunyah_vmid/gunyah_qcom.ko"' \
+            'su -c "lsmod | grep gunyah_qcom"' \
+            'su -c "dmesg | tail -30"' \
+            '```' \
+            '' \
+            '## 安装为 KernelSU 模块' \
+            '在 KernelSU/SukiSU 管理器里安装 gunyah_qcom_module.zip，重启即可。' \
+            '' \
+            '## 回退' \
+            '删除 /data/adb/modules/gunyah_vmid 并重启。' \
+            > "$MODDIR/README.md"
+
+          chmod 755 "$MODDIR/post-fs-data.sh" "$MODDIR/gunyah_qcom.ko"
+
+          python3 -c "import sys,zipfile,pathlib;src=pathlib.Path(sys.argv[1]);out=sys.argv[2];z=zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED);[z.write(p,p.name) for p in sorted(src.iterdir()) if p.is_file()];z.close()" \
+            "$MODDIR" "$GITHUB_WORKSPACE/gunyah_qcom_module.zip"
+
+          ls -l "$GITHUB_WORKSPACE/gunyah_qcom.ko" "$GITHUB_WORKSPACE/gunyah_qcom_module.zip"
+          echo "已生成 gunyah_qcom_module.zip（可直接在 KernelSU 管理器里安装）"
+
       - name: 打包签名内核 Bundle
         env:
           ABK_ARTIFACT_SIGNING_KEY_BASE64: ${{ secrets.ABK_ARTIFACT_SIGNING_KEY_BASE64 }}
@@ -6900,6 +6983,8 @@ jobs:
           name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}
           path: |
             *.bundle.zip
+            gunyah_qcom.ko
+            gunyah_qcom_module.zip
             ABK_FLASH_DEPENDENCIES.json
             LICENSE
             THIRD_PARTY_NOTICES.md
